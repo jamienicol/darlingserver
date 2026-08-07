@@ -51,6 +51,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <sys/prctl.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -80,6 +83,38 @@ void removeRuntimeDirectory(void) {
 	std::filesystem::remove_all(runtimeDirectory, error);
 }
 
+static const char runtimeDirectoryPrefix[] = "darling-standalone.";
+
+/**
+ * Clean up after runs that were SIGKILLed, which get no chance to clean up after themselves.
+ *
+ * A directory is stale if no live process holds its PID. Anything we can't parse or remove is left
+ * alone; this is opportunistic tidying, not a correctness requirement.
+ */
+void reapStaleRuntimeDirectories(const std::string& base) {
+	std::error_code error;
+
+	for (const auto& entry: std::filesystem::directory_iterator(base, error)) {
+		auto name = entry.path().filename().string();
+
+		if (name.compare(0, sizeof(runtimeDirectoryPrefix) - 1, runtimeDirectoryPrefix) != 0) {
+			continue;
+		}
+
+		pid_t owner = -1;
+
+		try {
+			owner = std::stoi(name.substr(sizeof(runtimeDirectoryPrefix) - 1));
+		} catch (...) {
+			continue;
+		}
+
+		if (owner > 0 && kill(owner, 0) != 0 && errno == ESRCH) {
+			std::filesystem::remove_all(entry.path(), error);
+		}
+	}
+}
+
 /**
  * Pick a private directory to hold the RPC socket and the server log.
  *
@@ -93,7 +128,9 @@ std::string createRuntimeDirectory(void) {
 		base = "/tmp";
 	}
 
-	std::string path = std::string(base) + "/darling-standalone." + std::to_string(getpid());
+	reapStaleRuntimeDirectories(base);
+
+	std::string path = std::string(base) + "/" + runtimeDirectoryPrefix + std::to_string(getpid());
 
 	std::error_code error;
 	std::filesystem::remove_all(path, error);
@@ -155,7 +192,27 @@ bool resolveExecutablePath(const std::string& root, const std::string& path, std
  * survives and relative paths still mean what they meant in the invoking shell.
  */
 [[noreturn]]
-void execViaMldr(const std::string& root, const std::string& socketPath, const std::string& program, char** programArgs) {
+void execViaMldr(const std::string& root, const std::string& socketPath, const std::string& program, char** programArgs, pid_t supervisorPID) {
+	// Never outlive the supervisor: without it there is nobody to answer this process's Mach traps,
+	// so it would hang forever on the first RPC. PR_SET_PDEATHSIG follows the forking *thread*,
+	// which is the one that goes on to run the event loop, and it survives the exec below.
+	if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0) {
+		std::cerr << "darlingserver: failed to set parent-death signal: " << strerror(errno) << std::endl;
+		_exit(127);
+	}
+
+	// ...and close the race where the supervisor died between the fork and the prctl above
+	if (getppid() != supervisorPID) {
+		_exit(128 + SIGKILL);
+	}
+
+	// The supervisor blocks the signals it forwards so that it can consume them through a signalfd.
+	// That mask is inherited across fork and exec, so it has to be undone here or the program would
+	// silently ignore SIGINT and friends.
+	sigset_t emptySet;
+	sigemptyset(&emptySet);
+	pthread_sigmask(SIG_SETMASK, &emptySet, NULL);
+
 	// Invoke mldr the way a shebang line would: argv[1] is the Mach-O to load, and mldr shifts argv
 	// down by one so the program sees it as its own argv[0]. Going through this path (rather than
 	// the `mldr!<path>` form) is what makes mldr unexpand argv[0] back into a vchroot path.
@@ -255,6 +312,36 @@ int standaloneMain(int argc, char** argv) {
 	std::string socketPath = runtimeDirectory + "/dserver.sock";
 	std::string logPath = runtimeDirectory + "/dserver.log";
 
+	// Take delivery of the signals a user would expect to interrupt the program through a signalfd
+	// rather than a handler, so that forwarding them happens as ordinary code on the event loop
+	// instead of async-signal-safe code racing it.
+	//
+	// This has to happen before anything spawns a thread: a process-directed signal is delivered to
+	// any thread that hasn't blocked it, so a workqueue thread created before the mask was set would
+	// take the SIGTERM with its default disposition and kill the supervisor out from under the child.
+	// A new thread inherits the mask of its creator, so blocking here covers all of them. The child
+	// inherits it too, across both the fork and the exec, and execViaMldr() undoes it there.
+	sigset_t forwardedSignals;
+	sigemptyset(&forwardedSignals);
+	sigaddset(&forwardedSignals, SIGTERM);
+	sigaddset(&forwardedSignals, SIGINT);
+	sigaddset(&forwardedSignals, SIGQUIT);
+	sigaddset(&forwardedSignals, SIGHUP);
+
+	if (pthread_sigmask(SIG_BLOCK, &forwardedSignals, NULL) != 0) {
+		std::cerr << "darlingserver: failed to block signals: " << strerror(errno) << std::endl;
+		removeRuntimeDirectory();
+		return 1;
+	}
+
+	int signalFD = signalfd(-1, &forwardedSignals, SFD_CLOEXEC | SFD_NONBLOCK);
+
+	if (signalFD < 0) {
+		std::cerr << "darlingserver: failed to create signalfd: " << strerror(errno) << std::endl;
+		removeRuntimeDirectory();
+		return 1;
+	}
+
 	// The server has to exist before the child runs: the constructor is what binds the socket, and
 	// mldr connects to it before it has even loaded dyld.
 	auto server = new DarlingServer::Server(root, socketPath, logPath);
@@ -266,18 +353,21 @@ int standaloneMain(int argc, char** argv) {
 
 	if (rootFD < 0) {
 		std::cerr << "darlingserver: failed to open " << root << ": " << strerror(errno) << std::endl;
+		removeRuntimeDirectory();
 		return 1;
 	}
 
 	server->setDefaultVchrootDirectory(std::make_shared<DarlingServer::FD>(rootFD));
 
+	pid_t supervisorPID = getpid();
 	pid_t child = fork();
 
 	if (child < 0) {
 		std::cerr << "darlingserver: failed to fork: " << strerror(errno) << std::endl;
+		removeRuntimeDirectory();
 		return 1;
 	} else if (child == 0) {
-		execViaMldr(root, socketPath, program, &argv[argi + 1]);
+		execViaMldr(root, socketPath, program, &argv[argi + 1], supervisorPID);
 	}
 
 	// Watch the child with a pidfd through the server's own event loop, so that we find out it
@@ -287,6 +377,7 @@ int standaloneMain(int argc, char** argv) {
 	if (pidfd < 0) {
 		std::cerr << "darlingserver: failed to open pidfd for child: " << strerror(errno) << std::endl;
 		kill(child, SIGKILL);
+		removeRuntimeDirectory();
 		return 1;
 	}
 
@@ -307,9 +398,22 @@ int standaloneMain(int argc, char** argv) {
 		_exit(WIFSIGNALED(status) ? (128 + WTERMSIG(status)) : WEXITSTATUS(status));
 	}));
 
+	// Forward the blocked signals to the program and let it decide what to do with them. If it dies,
+	// the pidfd monitor above reports the status; if it chooses to ignore them, we keep running,
+	// which is what a shell would do.
+	server->addMonitor(std::make_shared<DarlingServer::Monitor>(std::make_shared<DarlingServer::FD>(signalFD), DarlingServer::Monitor::Event::Readable, false, false, [child](std::shared_ptr<DarlingServer::Monitor> monitor, DarlingServer::Monitor::Event events) {
+		struct signalfd_siginfo info;
+
+		while (read(monitor->fd()->fd(), &info, sizeof(info)) == sizeof(info)) {
+			kill(child, info.ssi_signo);
+		}
+	}));
+
 	server->start();
 
 	// start() only returns on error
 	std::cerr << "darlingserver: server exited main loop" << std::endl;
+	kill(child, SIGKILL);
+	removeRuntimeDirectory();
 	return 1;
 }
