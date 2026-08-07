@@ -497,6 +497,9 @@ static void handle_sigusr1(int signum) {
 };
 #endif
 
+// see standalone.cpp
+extern int standaloneMain(int argc, char** argv);
+
 int main(int argc, char** argv) {
 	const char* prefix = NULL;
 	uid_t originalUID = -1;
@@ -514,6 +517,12 @@ int main(int argc, char** argv) {
 	char *opts;
 	char putOld[4096];
 	char *p;
+
+	// standalone mode is the one way darlingserver *is* meant to be started manually,
+	// so it has to be checked before the argument count check below
+	if (argc >= 2 && strcmp(argv[1], "--standalone") == 0) {
+		return standaloneMain(argc, argv);
+	}
 
 	if (argc < 6) {
 		fprintf(stderr, "darlingserver is not meant to be started manually\n");

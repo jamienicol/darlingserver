@@ -40,6 +40,7 @@ namespace DarlingServer {
 		int _listenerSocket;
 		std::string _prefix;
 		std::string _socketPath;
+		std::string _logPath;
 		int _epollFD;
 		MessageQueue _inbox;
 		MessageQueue _outbox;
@@ -53,6 +54,7 @@ namespace DarlingServer {
 		std::vector<std::shared_ptr<Monitor>> _monitors;
 		std::vector<std::shared_ptr<Monitor>> _monitorsWaitingToDie;
 		std::mutex _monitorsLock;
+		std::shared_ptr<FD> _defaultVchrootDirectory;
 
 		void _worker(std::shared_ptr<Thread> thread);
 
@@ -60,6 +62,15 @@ namespace DarlingServer {
 
 	public:
 		Server(std::string prefix);
+
+		/**
+		 * Like Server(prefix), but with the socket and log file placed outside the prefix.
+		 *
+		 * This is used by standalone mode, where the prefix is the (possibly read-only)
+		 * Darling root rather than a per-user writable overlay.
+		 */
+		Server(std::string prefix, std::string socketPath, std::string logPath);
+
 		~Server();
 
 		Server(const Server&) = delete;
@@ -72,6 +83,17 @@ namespace DarlingServer {
 		void monitorProcess(std::shared_ptr<Process> process);
 
 		std::string prefix() const;
+		std::string logPath() const;
+
+		/**
+		 * The vchroot given to processes that check in without a registered parent to inherit from.
+		 *
+		 * In container mode this is null: launchd establishes its own vchroot via the `vchroot`
+		 * helper and every other process descends from it. Standalone mode sets it instead, so that
+		 * the program can be exec'd directly and keep the caller's working directory.
+		 */
+		std::shared_ptr<FD> defaultVchrootDirectory() const;
+		void setDefaultVchrootDirectory(std::shared_ptr<FD> directoryDescriptor);
 
 		static Server& sharedInstance();
 

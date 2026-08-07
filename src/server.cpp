@@ -439,8 +439,13 @@ struct DTapeHooks {
 };
 
 DarlingServer::Server::Server(std::string prefix):
+	Server(prefix, prefix + "/.darlingserver.sock", prefix + "/private/var/log/dserver.log")
+{};
+
+DarlingServer::Server::Server(std::string prefix, std::string socketPath, std::string logPath):
 	_prefix(prefix),
-	_socketPath(_prefix + "/.darlingserver.sock"),
+	_socketPath(socketPath),
+	_logPath(logPath),
 	_workQueue(std::bind(&Server::_worker, this, std::placeholders::_1))
 {
 	sharedInstancePointer = this;
@@ -674,6 +679,18 @@ void DarlingServer::Server::monitorProcess(std::shared_ptr<Process> process) {
 
 DarlingServer::Server& DarlingServer::Server::sharedInstance() {
 	return *sharedInstancePointer;
+};
+
+std::string DarlingServer::Server::logPath() const {
+	return _logPath;
+};
+
+std::shared_ptr<DarlingServer::FD> DarlingServer::Server::defaultVchrootDirectory() const {
+	return _defaultVchrootDirectory;
+};
+
+void DarlingServer::Server::setDefaultVchrootDirectory(std::shared_ptr<FD> directoryDescriptor) {
+	_defaultVchrootDirectory = directoryDescriptor;
 };
 
 std::string DarlingServer::Server::prefix() const {

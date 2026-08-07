@@ -19,6 +19,7 @@
 
 #include <darlingserver/process.hpp>
 #include <darlingserver/registry.hpp>
+#include <darlingserver/server.hpp>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <sys/uio.h>
@@ -80,6 +81,9 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 
 		// inherit groups from parent process
 		_groups = parentProcess->_groups;
+	} else if (auto defaultVchroot = Server::sharedInstance().defaultVchrootDirectory()) {
+		// no parent to inherit a vchroot from, but the server has one to hand out (standalone mode)
+		setVchrootDirectory(defaultVchroot);
 	}
 
 	// NOTE: see thread.cpp for why it's okay to use `this` here

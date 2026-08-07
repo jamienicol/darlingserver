@@ -107,6 +107,7 @@ add_custom_target(generate_dserver_rpc_wrappers
 
 add_executable(darlingserver
 	src/darlingserver.cpp
+	src/standalone.cpp
 	src/server.cpp
 	src/message.cpp
 	src/call.cpp
